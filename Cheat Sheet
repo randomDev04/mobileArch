@@ -1,0 +1,362 @@
+# 🏋️Senior Engineer Cheat Sheet
+
+> A living reference for architecture decisions, patterns, and production engineering principles
+
+---
+
+## 📌 Table of Contents
+
+1. [Project Overview](#1-project-overview)
+2. [Tech Stack](#2-tech-stack)
+3. [Folder Structure](#3-folder-structure)
+4. [Architecture Decisions](#4-architecture-decisions)
+5. [State Management Rules](#5-state-management-rules)
+6. [Network Layer](#6-network-layer)
+7. [Payment System Design](#7-payment-system-design)
+8. [Real-Time Tracking](#8-real-time-tracking)
+9. [Key Type Patterns](#9-key-type-patterns)
+10. [Cache Key Strategy](#10-cache-key-strategy)
+11. [The 4 Layers — Apply to Every Problem](#11-the-4-layers--apply-to-every-problem)
+12. [Mentor Rules — How to Think Like a Senior Engineer](#12-mentor-rules--how-to-think-like-a-senior-engineer)
+
+---
+
+## 1. Project Overview
+
+**Gymuzzi** is a production fitness platform with the following feature domains:
+
+| Feature | Description |
+|---|---|
+| `auth` | Login, OTP, registration |
+| `gyms` | Gym discovery and profiles |
+| `checkin` | QR-based gym check-in |
+| `wallet` | In-app wallet and balance |
+| `chat` | Messaging and support tickets |
+| `notifications` | Push and in-app notifications |
+| `home` | Home feed and dashboard |
+| `account` | User profile and settings |
+| `admin` | Admin workflows and tooling |
+
+---
+
+## 2. Tech Stack
+
+### Mobile
+| Tool | Role |
+|---|---|
+| React Native (Expo + CLI) + TypeScript | App framework |
+| Redux Toolkit | Global client state (auth, session) |
+| RTK Async Thunks | Side-effect orchestration |
+| React Navigation | Screen routing |
+| Axios | HTTP client (`publicClient` / `privateClient`) |
+| React Native Reanimated | Animations |
+| React Native MMKV | Synchronous persistent storage |
+| Redux Persist | State hydration across sessions |
+
+### Backend
+| Tool | Role |
+|---|---|
+| Node.js + MongoDB | Current API backend |
+| Go (planned) | High-performance services |
+| REST APIs | Communication protocol |
+
+---
+
+## 3. Folder Structure
+
+```
+src/
+├── assets/
+├── components/              ← Global reusable UI ONLY
+├── features/
+│   ├── auth/
+│   │   ├── components/      ← Feature-specific UI
+│   │   ├── screens/         ← Screen components
+│   │   ├── hooks/           ← useAuth, etc.
+│   │   ├── store/           ← authSlice.ts
+│   │   ├── services/        ← authService.ts
+│   │   └── types/           ← auth.types.ts
+│   ├── gyms/
+│   ├── checkin/
+│   ├── wallet/
+│   ├── chat/
+│   ├── notifications/
+│   ├── home/
+│   ├── account/
+│   └── admin/
+├── services/
+│   └── api/
+│       ├── apiCore.ts
+│       ├── publicClient.ts  ← Pre-auth endpoints
+│       └── privateClient.ts ← Post-auth (token auto-attached)
+├── store/
+│   ├── store.ts
+│   ├── rootReducer.ts
+│   └── reduxHooks.ts
+├── navigation/
+├── hooks/                   ← Global hooks ONLY
+├── constants/
+├── configs/
+├── types/                   ← Global shared types ONLY
+└── utils/
+```
+
+> **Rule:** If a type, component, or hook is only used inside one feature — it lives inside that feature folder, not at the top level.
+
+---
+
+## 4. Architecture Decisions
+
+### Client Split
+```
+publicClient   →  login, OTP, register (no token needed)
+privateClient  →  all authenticated endpoints (token auto-attached via interceptor)
+```
+
+### Service Layer Pattern
+```
+Screen → Hook → Thunk → Service → Client → API
+```
+- Screens **never** touch Redux directly
+- Thunks call services; services call clients
+- Token is **never** passed through thunks or components
+- Centralized endpoints in `services/api/endpoints.ts`
+
+### Per-Operation Async Status
+```ts
+type AsyncStatus = 'idle' | 'loading' | 'success' | 'error';
+```
+Every async operation gets its **own** `AsyncStatus` — never a single `isLoading` boolean for a whole slice.
+
+### Toast Handling
+```ts
+// ✅ Always use the centralized utility
+showToast({ type: 'error', message: 'OTP expired. Try again.' });
+
+// ❌ Never call toast libraries directly in components
+```
+
+---
+
+## 5. State Management Rules
+
+| Data Type | Where it lives | Why |
+|---|---|---|
+| API / server data | React Query | Caching, refetch, staleness |
+| Global client state | Redux Toolkit + MMKV | Auth session, user prefs |
+| Local UI state | `useState` | Ephemeral, component-scoped |
+| Navigation state | React Navigation | Screen-level concern |
+
+> ⚠️ **Never put raw API data in Redux.** Redux is for client state — not a cache for server responses.
+
+---
+
+## 6. Network Layer
+
+Build in this order — one concern per layer:
+
+```
+1. Axios instance     → one instance per client (public / private)
+2. Request interceptor  → attach token, add request ID, set adaptive timeout
+3. Response interceptor → handle 401, queue token refresh, retry after refresh
+4. Retry logic        → exponential backoff, retryable status codes only (5xx, network errors)
+5. API functions      → thin wrappers — no business logic inside
+```
+
+### Token Contract
+```
+Header key: "token"   ← existing backend contract, don't break this
+```
+
+### Retry Rules
+```
+✅ Retry on: 500, 502, 503, 504, network timeout
+❌ Never retry: 400, 401, 403, 404, 422
+```
+
+---
+
+## 7. Payment System Design
+
+### State Machine
+```
+IDLE → INITIATING → PROCESSING → SUCCESS
+                              → FAILED
+                              → UNKNOWN  ← ⚠️ critical state
+```
+
+### UNKNOWN vs FAILED — The Critical Distinction
+
+| State | Meaning | What to show |
+|---|---|---|
+| `FAILED` | Request never left device | Safe to retry |
+| `UNKNOWN` | Money **may have moved** | Never show FAILED — poll server |
+
+### Implementation Rules
+```
+1. Write to MMKV BEFORE the request leaves the device
+2. Idempotency key = deterministic (userId + orderId + amount)
+3. On app resume → poll server → resolve UNKNOWN state
+4. After 5 polls → hand off to push notification channel
+```
+
+---
+
+## 8. Real-Time Tracking
+
+### Two Channels — Never Conflate Them
+```
+Push Notifications  →  state changes (check-in confirmed, booking updated)
+WebSocket           →  live location / real-time data stream
+```
+
+### On App Foreground Resume
+```
+1. Show last known location immediately (MMKV cache)
+2. REST sync to get current state
+3. Resume WebSocket connection
+```
+
+### Reliability
+```
+Heartbeat every 30s → detect zombie WebSocket connections
+Location trigger    → 100m moved OR 15s elapsed (whichever comes first)
+Battery adaptive    → reduce accuracy when battery < 20% or speed is low
+```
+
+---
+
+## 9. Key Type Patterns
+
+```ts
+// Per-feature async status
+type AsyncStatus = 'idle' | 'loading' | 'success' | 'error';
+
+// ✅ Every feature has its own types file
+// features/auth/types/auth.types.ts
+
+// ✅ Global shared types only in
+// src/types/
+
+// ❌ No `any[]` — everything is typed
+```
+
+### Typed Request/Response — Example
+```ts
+// features/auth/types/auth.types.ts
+export interface LoginRequest {
+  phone: string;
+  otp: string;
+}
+
+export interface LoginResponse {
+  token: string;
+  user: User;
+}
+```
+
+---
+
+## 10. Cache Key Strategy
+
+```
+Pattern:   feature:resource:identifier
+Example:   gym:detail:gym_892
+Example:   checkin:history:user_441
+Example:   wallet:balance:user_441
+```
+
+### Rules
+```
+✅ Always use a key factory — never hardcode strings
+✅ Invalidate by prefix after any write operation
+❌ Never mix concerns in a single cache key
+```
+
+### Key Factory Pattern
+```ts
+export const gymKeys = {
+  all: ['gym'] as const,
+  detail: (id: string) => ['gym', 'detail', id] as const,
+  list: (filters: GymFilters) => ['gym', 'list', filters] as const,
+};
+```
+
+---
+
+## 11. The 4 Layers — Apply to Every Problem
+
+When designing any feature, answer all four layers before writing code:
+
+```
+Layer 1 — What can the user DO?
+          (actions, flows, edge cases)
+
+Layer 2 — What DATA do we need?
+          (shape, source, ownership)
+
+Layer 3 — How does data MOVE and CHANGE?
+          (fetch, mutate, cache, sync)
+
+Layer 4 — What can go WRONG?
+          (network failures, race conditions, stale data, auth expiry)
+```
+
+> Apply this to every PR, every feature, every system design question.
+
+---
+
+## 12. Mentor Rules — How to Think Like a Senior Engineer
+
+### Answering Any Architecture Question
+```
+WHAT    → the solution
+WHY     → the reasoning behind it
+WHY NOT → the trade-off you consciously rejected
+```
+
+### When You Don't Know
+```
+✅ "My instinct is X — is that the right direction?"
+❌ Going silent
+❌ Making something up
+```
+
+### Interview / Design Session — First 2 Minutes
+```
+1. Clarify scope
+2. State your approach
+3. Name the hardest constraint first
+4. Build architecture
+```
+
+### Engineering Mindset
+```
+✅ Name the file, the line, the pattern
+✅ Point out bugs — not just style issues
+✅ Suggest improvements step by step
+✅ Never rewrite everything at once
+✅ Understand trade-offs before choosing
+```
+
+---
+
+## Quick Reference — Decision Table
+
+| Situation | Decision |
+|---|---|
+| Pre-auth API call | `publicClient` |
+| Post-auth API call | `privateClient` |
+| Server/API data | React Query |
+| Auth session / user prefs | Redux + MMKV |
+| Local toggle / modal state | `useState` |
+| Async op status | Per-op `AsyncStatus`, not `isLoading` |
+| Toast notification | `showToast()` utility |
+| Payment fails with no response | `UNKNOWN` — poll, never show FAILED |
+| Real-time location | WebSocket |
+| Order state change event | Push notification |
+| Cache key | `feature:resource:id` with key factory |
+
+---
+
+*Gymuzzi Engineering — Keep this file up to date as the architecture evolves.*
